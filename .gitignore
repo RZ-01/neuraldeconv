@@ -18,3 +18,5 @@ non-blind-deconv/gt_dragon.ply
 inference_2d/
 runs/
 Deblur-INR/
+
+*.txt

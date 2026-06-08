@@ -146,8 +146,8 @@ def psf_deterministic_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/nonblind/Deblur-INR/datasets/lai/im05_ker04.png")
-    parser.add_argument("--psf_path", type=str, default="/workspace/nonblind/Deblur-INR/results/ker04_truth.png",
+    parser.add_argument("--image_path", type=str, default="/workspace/Deblur-INR/datasets/lai/im05_ker04.png")
+    parser.add_argument("--psf_path", type=str, default="/workspace/Deblur-INR/results/ker04_truth.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=5e-3)

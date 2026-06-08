@@ -140,14 +140,14 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/nonblind/Deblur-INR/datasets/lai/im05_ker04.png")
-    parser.add_argument("--psf_path", type=str, default="/workspace/nonblind/Deblur-INR/results/ker04_truth.png",
+    parser.add_argument("--image_path", type=str, default="/workspace/Deblur-INR/datasets/lai/im05_ker04.png")
+    parser.add_argument("--psf_path", type=str, default="/workspace/Deblur-INR/results/ker04_truth.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_mc.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_mc")
-    parser.add_argument("--num_mc_samples", type=int, default=800)
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04")
+    parser.add_argument("--num_mc_samples", type=int, default=2500)
     parser.add_argument("--mc_jitter", action="store_true",
                         help="Add U(-0.5,+0.5) jitter inside sampled PSF bins. Off by default to match discrete convolution.")
     parser.add_argument("--boundary", choices=("reflect", "clamp"), default="reflect",
