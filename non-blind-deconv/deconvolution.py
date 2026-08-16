@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import torch.utils.checkpoint
 
 from models.instantngp import InstantNGPTorchModel
 
@@ -79,38 +80,63 @@ def psf_uniform_sampling_step(
     inv_shape: torch.Tensor,
     stochastic_alpha: float = 0.0,
     use_reflect: bool = True,
+    mc_chunk_size: int = 0,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
 
     num_pixels = target_coords.shape[0]
     n_dims = target_coords.shape[1]
-    sampling_budget = num_pixels * num_mc_samples
-
-    sampled_offsets = generate_offsets_on_gpu(
-        sampling_budget,
-        discrete_psf=discrete_psf,
-    )  # (N, 2), pixel units
-
     inv_shape_gpu = inv_shape.to(device, non_blocking=True)
-    sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
-    source_coords = target_coords.unsqueeze(1) + sampled_offsets
-    if use_reflect:
-        source_coords = reflect_coords(source_coords)
+    use_chunked = 0 < mc_chunk_size < num_mc_samples
+
+    if not use_chunked:
+        sampling_budget = num_pixels * num_mc_samples
+        sampled_offsets = generate_offsets_on_gpu(
+            sampling_budget, discrete_psf=discrete_psf,
+        )
+        sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
+        source_coords = target_coords.unsqueeze(1) + sampled_offsets
+        if use_reflect:
+            source_coords = reflect_coords(source_coords)
+        else:
+            source_coords = torch.clamp(source_coords, 0.0, 1.0)
+        source_coords_flat = source_coords.view(-1, n_dims)
+        coords_for_model = torch.stack([
+            source_coords_flat[:, 1], source_coords_flat[:, 0],
+        ], dim=-1).float()
+        coords_for_model.requires_grad_(False)
+        pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
+        simulated_values = pred_flat.view(num_pixels, num_mc_samples).mean(dim=1)
     else:
-        source_coords = torch.clamp(source_coords, 0.0, 1.0)
-    source_coords_flat = source_coords.view(-1, n_dims)
+        running_sum = torch.zeros(num_pixels, device=device)
+        total_samples = 0
+        for c_start in range(0, num_mc_samples, mc_chunk_size):
+            c_size = min(mc_chunk_size, num_mc_samples - c_start)
+            total_samples += c_size
 
-    coords_for_model = torch.stack([
-        source_coords_flat[:, 1],
-        source_coords_flat[:, 0],
-    ], dim=-1).float()
-    coords_for_model.requires_grad_(False)
+            def _chunk_fn(tc, _cs=c_size):
+                offsets = generate_offsets_on_gpu(
+                    num_pixels * _cs, discrete_psf=discrete_psf,
+                )
+                offsets = (offsets * inv_shape_gpu).view(num_pixels, _cs, n_dims)
+                src = tc.unsqueeze(1) + offsets
+                if use_reflect:
+                    src = reflect_coords(src)
+                else:
+                    src = torch.clamp(src, 0.0, 1.0)
+                src_flat = src.view(-1, n_dims)
+                coords = torch.stack([src_flat[:, 1], src_flat[:, 0]], dim=-1).float()
+                pred, _ = model(coords, variance=None, stochastic_alpha=stochastic_alpha)
+                return pred.view(num_pixels, _cs).sum(dim=1)
 
-    pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
-    pred_samples = pred_flat.view(num_pixels, num_mc_samples)
-    simulated_values = pred_samples.mean(dim=1)
+            chunk_sum = torch.utils.checkpoint.checkpoint(
+                _chunk_fn, target_coords, use_reentrant=False,
+            )
+            running_sum = running_sum + chunk_sum
+
+        simulated_values = running_sum / total_samples
 
     data_loss = F.mse_loss(simulated_values.float(), target_values.float()) * 100
 
@@ -135,6 +161,9 @@ def main():
     parser.add_argument("--progressive_steps", type=int, default=300)
     parser.add_argument("--num_pixels_per_step", type=int, default=6500,
                         help="Number of pixels sampled per training step (default: 4096).")
+    parser.add_argument("--mc_chunk_size", type=int, default=0,
+                        help="MC samples per chunk (0=no chunking). Reduces peak GPU memory "
+                             "from O(P*M) to O(P*chunk) via gradient checkpointing (~2x compute).")
 
     # Stochastic preconditioning
     parser.add_argument("--sp_alpha_init", type=float, default=0.03)
@@ -290,6 +319,7 @@ def main():
             inv_shape=inv_shape,
             stochastic_alpha=current_alpha,
             use_reflect=(args.boundary == "reflect"),
+            mc_chunk_size=args.mc_chunk_size,
         )
 
         for key, value in loss_dict.items():
