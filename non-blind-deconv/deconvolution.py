@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = "2000000000"
 import numpy as np
 import cv2
 import torch
@@ -7,10 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
-from models.nglod import NglodModel
+from models.instantngp import InstantNGPTorchModel
 
 class ImageDataset(Dataset):
     def __init__(self, norm_image_tensor, num_pixels_per_step, num_batches):
@@ -52,28 +52,22 @@ class ImageDataset(Dataset):
 def generate_offsets_on_gpu(
     n: int,
     discrete_psf: torch.Tensor,
-    device: torch.device,
 ) -> torch.Tensor:
-    """
-    Sample n PSF offsets on the GPU.
-
-    Steps:
-      1. Sample a histogram bin via multinomial (integer pixel offset).
-      2. Add uniform jitter within that pixel: U(-0.5, +0.5) per axis.
-
-    Returns offsets of shape (n, 2), float32, in pixel units centred at PSF origin.
-    """
     psf_flat = discrete_psf.flatten()
     psf_flat = psf_flat / psf_flat.sum()
     idx = torch.multinomial(psf_flat, n, replacement=True)
     h, w = discrete_psf.shape
     y_idx = idx // w
     x_idx = idx % w
-    jitter = torch.rand((n, 2), device=device) - 0.5
     return torch.stack([
-        y_idx.float() - (h - 1) / 2.0 + jitter[:, 0],
-        x_idx.float() - (w - 1) / 2.0 + jitter[:, 1],
+        y_idx.float() - (h - 1) / 2.0,
+        x_idx.float() - (w - 1) / 2.0,
     ], dim=1)
+
+
+def reflect_coords(source_coords: torch.Tensor) -> torch.Tensor:
+    s = source_coords.abs()
+    return (1.0 - (s - 1.0).abs()).clamp(0.0, 1.0)
 
 
 def psf_uniform_sampling_step(
@@ -84,6 +78,7 @@ def psf_uniform_sampling_step(
     discrete_psf: torch.Tensor,
     inv_shape: torch.Tensor,
     stochastic_alpha: float = 0.0,
+    use_reflect: bool = True,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
@@ -93,21 +88,23 @@ def psf_uniform_sampling_step(
     sampling_budget = num_pixels * num_mc_samples
 
     sampled_offsets = generate_offsets_on_gpu(
-        sampling_budget, discrete_psf=discrete_psf, device=device,
+        sampling_budget,
+        discrete_psf=discrete_psf,
     )  # (N, 2), pixel units
 
     inv_shape_gpu = inv_shape.to(device, non_blocking=True)
     sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
     source_coords = target_coords.unsqueeze(1) + sampled_offsets
-    source_coords = torch.clamp(source_coords, 0.0, 1.0)
+    if use_reflect:
+        source_coords = reflect_coords(source_coords)
+    else:
+        source_coords = torch.clamp(source_coords, 0.0, 1.0)
     source_coords_flat = source_coords.view(-1, n_dims)
 
-    # NglodModel requires 3-D input; pad with a fixed z=0.5 (image lives at mid-plane)
     coords_for_model = torch.stack([
         source_coords_flat[:, 1],
         source_coords_flat[:, 0],
-        torch.full((source_coords_flat.shape[0],), 0.5, device=device),
     ], dim=-1).float()
     coords_for_model.requires_grad_(False)
 
@@ -115,7 +112,7 @@ def psf_uniform_sampling_step(
     pred_samples = pred_flat.view(num_pixels, num_mc_samples)
     simulated_values = pred_samples.mean(dim=1)
 
-    data_loss = F.mse_loss(simulated_values.float(), target_values.float())
+    data_loss = F.mse_loss(simulated_values.float(), target_values.float()) * 100
 
     return {
         "reconstruction_loss": data_loss,
@@ -125,33 +122,34 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/nonblind/Deblur-INR/datasets/lai/im05_ker04_fft_circular.png")
-    parser.add_argument("--psf_path", type=str, default="/workspace/nonblind/Deblur-INR/results/ker04_truth.png",
+    parser.add_argument("--image_path", type=str, default="/workspace/Deblur-INR/datasets/lai/im05_ker04.png")
+    parser.add_argument("--psf_path", type=str, default="/workspace/ker04_truth.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_fft_circular.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_fft_circular")
-    parser.add_argument("--num_mc_samples", type=int, default=100)
-    parser.add_argument("--progressive_steps", type=int, default=2000)
-    parser.add_argument("--num_pixels_per_step", type=int, default=10000,
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_best_with_calculation.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_best_with_calculation")
+    parser.add_argument("--num_mc_samples", type=int, default=4000)
+    parser.add_argument("--boundary", choices=("reflect", "clamp"), default="reflect",
+                        help="Boundary handling for sampled source coordinates.")
+    parser.add_argument("--progressive_steps", type=int, default=300)
+    parser.add_argument("--num_pixels_per_step", type=int, default=6500,
                         help="Number of pixels sampled per training step (default: 4096).")
 
     # Stochastic preconditioning
     parser.add_argument("--sp_alpha_init", type=float, default=0.03)
     parser.add_argument("--sp_decay_fraction", type=float, default=0.33)
 
-    # NglodModel config
-    # base_lod=0 + num_lods=9 → finest 2D resolution = 2^(8+0) = 256 × 256
-    parser.add_argument("--num_lods",     type=int, default=9,   help="Total number of octree LODs")
-    parser.add_argument("--base_lod",     type=int, default=0,   help="Coarsest active LOD index")
-    parser.add_argument("--feature_dim",  type=int, default=16,  help="Feature dim per octree node")
-    parser.add_argument("--feature_size", type=int, default=4,   help="Base spatial resolution of feature grid")
-    parser.add_argument("--hidden_dim",   type=int, default=128, help="MLP hidden width")
-    parser.add_argument("--num_layers",   type=int, default=2,   help="MLP hidden layers")
-    parser.add_argument("--sdfnet_root",  type=str,
-                        default="/workspace/nonblind/workspace/non-blind-deconv/models/sdf-net",
-                        help="Path to sdf-net directory")
+    # Encoder config
+    parser.add_argument("--num_levels", type=int, default=21)
+    parser.add_argument("--level_dim", type=int, default=2)
+    parser.add_argument("--base_resolution", type=int, default=16)
+    parser.add_argument("--log2_hashmap_size", type=int, default=24)
+    parser.add_argument("--desired_resolution", type=int, default=1600)
+
+    # Decoder config
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=2)
 
     args = parser.parse_args()
 
@@ -179,16 +177,39 @@ def main():
 
     print(f"Image loaded: shape={image_norm.shape}")
     num_pixels_per_step = args.num_pixels_per_step
+    n_dims = 2
+    # calculate mc sample count and steps based on input image
+    # Image (H, W) PSF size(h,w)
+    # pixel per step: 6500
+    # steps: HxWx160/6500
+    # mc samples: hxw x 5.4869
+    h, w = image_norm.shape
+    num_pixels_per_step = 6500
+    steps = min(int(h * w * 160 / num_pixels_per_step), 10000)
 
-    model = NglodModel(
-        n_input_dims=3,
-        num_lods=args.num_lods,
-        base_lod=args.base_lod,
-        feature_dim=args.feature_dim,
-        feature_size=args.feature_size,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        sdfnet_root=args.sdfnet_root,
+    encoder_config = {
+        "otype": "HashGrid",
+        "n_levels": args.num_levels,
+        "n_features_per_level": args.level_dim,
+        "log2_hashmap_size": args.log2_hashmap_size,
+        "base_resolution": args.base_resolution,
+        "per_level_scale": np.exp(
+            (np.log(args.desired_resolution) - np.log(args.base_resolution)) / (args.num_levels - 1)
+        ),
+    }
+    decoder_config = {
+        "otype": "FullyFusedMLP",
+        "activation": "ReLU",
+        "output_activation": "None",
+        "n_neurons": args.hidden_dim,
+        "n_hidden_layers": args.num_layers,
+    }
+
+    model = InstantNGPTorchModel(
+        encoder_config=encoder_config,
+        decoder_config=decoder_config,
+        n_input_dims=n_dims,
+        learn_variance=False,
     ).to(device)
     model.train()
 
@@ -213,33 +234,36 @@ def main():
     discrete_psf_np /= psf_sum
     discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
     # scipy.ndimage.convolve flips the kernel; flip here so the forward model matches
-    discrete_psf = torch.flip(discrete_psf, [0, 1])
+    # discrete_psf = torch.flip(discrete_psf, [0, 1])
     print(f"PSF loaded: shape={discrete_psf.shape}")
+    h_psf, w_psf = discrete_psf.shape
+    num_mc_samples = min(int(h_psf * w_psf * 4000 / 729), 4000)  # scale with PSF size, but max 4000
+    print(f"Calculated steps: {steps}, num_mc_samples: {num_mc_samples}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=0)
     scaler = torch.amp.GradScaler('cuda')
     writer = SummaryWriter(log_dir=args.logdir)
 
     dataset = ImageDataset(
         norm_image_tensor=image_norm,
         num_pixels_per_step=num_pixels_per_step,
-        num_batches=args.steps,
+        num_batches=steps,
     )
     inv_shape = dataset.inv_shape
 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     data_iter = iter(dataloader)
 
-    n_levels = args.num_lods
-    initial_levels = 1  # start from coarsest LOD and ramp up
+    n_levels = args.num_levels
+    initial_levels = 4
     steps_per_level = args.progressive_steps // max(n_levels - initial_levels, 1)
-    sp_decay_steps = int(args.steps * args.sp_decay_fraction)
+    sp_decay_steps = int(steps * args.sp_decay_fraction)
     last_set_level = -1
 
-    pbar = tqdm(total=args.steps, desc="Training", dynamic_ncols=True)
+    pbar = tqdm(total=steps, desc="Training", dynamic_ncols=True)
 
-    for step in range(args.steps):
+    for step in range(steps):
         current_level = min(initial_levels + (step // steps_per_level), n_levels)
         if current_level != last_set_level:
             model.set_max_level(current_level)
@@ -256,14 +280,16 @@ def main():
         else:
             current_alpha = 0.0
 
+        
         loss_dict = psf_uniform_sampling_step(
             model=model,
             batch=batch,
-            num_mc_samples=args.num_mc_samples,
+            num_mc_samples=num_mc_samples,
             device=device,
             discrete_psf=discrete_psf,
             inv_shape=inv_shape,
             stochastic_alpha=current_alpha,
+            use_reflect=(args.boundary == "reflect"),
         )
 
         for key, value in loss_dict.items():
@@ -289,14 +315,8 @@ def main():
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'nglod_config': {
-            'num_lods':     args.num_lods,
-            'base_lod':     args.base_lod,
-            'feature_dim':  args.feature_dim,
-            'feature_size': args.feature_size,
-            'hidden_dim':   args.hidden_dim,
-            'num_layers':   args.num_layers,
-        },
+        'encoder_config': encoder_config,
+        'decoder_config': decoder_config,
     }, args.save_path)
     print(f"\nSaved model to {args.save_path}")
 
