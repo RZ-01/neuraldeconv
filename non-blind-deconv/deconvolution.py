@@ -164,6 +164,10 @@ def main():
     parser.add_argument("--mc_chunk_size", type=int, default=0,
                         help="MC samples per chunk (0=no chunking). Reduces peak GPU memory "
                              "from O(P*M) to O(P*chunk) via gradient checkpointing (~2x compute).")
+    parser.add_argument("--mode", choices=("mc", "sliding_window"), default="mc",
+                        help="Training mode: 'mc' (random pixels + MC) or 'sliding_window' (dense patch + MC).")
+    parser.add_argument("--patch_size", type=int, default=2048,
+                        help="Patch side length for sliding_window mode.")
 
     # Stochastic preconditioning
     parser.add_argument("--sp_alpha_init", type=float, default=0.03)
@@ -274,21 +278,29 @@ def main():
     scaler = torch.amp.GradScaler('cuda')
     writer = SummaryWriter(log_dir=args.logdir)
 
-    dataset = ImageDataset(
-        norm_image_tensor=image_norm,
-        num_pixels_per_step=num_pixels_per_step,
-        num_batches=steps,
-    )
-    inv_shape = dataset.inv_shape
-
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-    data_iter = iter(dataloader)
+    if args.mode == "mc":
+        dataset = ImageDataset(
+            norm_image_tensor=image_norm,
+            num_pixels_per_step=num_pixels_per_step,
+            num_batches=steps,
+        )
+        inv_shape = dataset.inv_shape
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+        data_iter = iter(dataloader)
+    else:
+        inv_shape = torch.tensor(
+            [1.0 / max(h - 1, 1), 1.0 / max(w - 1, 1)],
+            dtype=torch.float32,
+        )
 
     n_levels = args.num_levels
     initial_levels = 4
     steps_per_level = args.progressive_steps // max(n_levels - initial_levels, 1)
     sp_decay_steps = int(steps * args.sp_decay_fraction)
     last_set_level = -1
+
+    if args.mode == "sliding_window":
+        from sliding_window import sliding_window_step
 
     pbar = tqdm(total=steps, desc="Training", dynamic_ncols=True)
 
@@ -298,9 +310,6 @@ def main():
             model.set_max_level(current_level)
             last_set_level = current_level
 
-        batch = next(data_iter)
-        batch = {k: (v.squeeze(0) if hasattr(v, 'squeeze') else v) for k, v in batch.items()}
-
         optimizer.zero_grad(set_to_none=True)
 
         if step < sp_decay_steps:
@@ -309,18 +318,33 @@ def main():
         else:
             current_alpha = 0.0
 
-        
-        loss_dict = psf_uniform_sampling_step(
-            model=model,
-            batch=batch,
-            num_mc_samples=num_mc_samples,
-            device=device,
-            discrete_psf=discrete_psf,
-            inv_shape=inv_shape,
-            stochastic_alpha=current_alpha,
-            use_reflect=(args.boundary == "reflect"),
-            mc_chunk_size=args.mc_chunk_size,
-        )
+        if args.mode == "mc":
+            batch = next(data_iter)
+            batch = {k: (v.squeeze(0) if hasattr(v, 'squeeze') else v) for k, v in batch.items()}
+            loss_dict = psf_uniform_sampling_step(
+                model=model,
+                batch=batch,
+                num_mc_samples=num_mc_samples,
+                device=device,
+                discrete_psf=discrete_psf,
+                inv_shape=inv_shape,
+                stochastic_alpha=current_alpha,
+                use_reflect=(args.boundary == "reflect"),
+                mc_chunk_size=args.mc_chunk_size,
+            )
+        else:
+            loss_dict = sliding_window_step(
+                model=model,
+                image_norm=image_norm,
+                patch_size=args.patch_size,
+                num_mc_samples=num_mc_samples,
+                device=device,
+                discrete_psf=discrete_psf,
+                inv_shape=inv_shape,
+                stochastic_alpha=current_alpha,
+                use_reflect=(args.boundary == "reflect"),
+                mc_chunk_size=args.mc_chunk_size,
+            )
 
         for key, value in loss_dict.items():
             writer.add_scalar(f"train/{key}", value.item(), step)
