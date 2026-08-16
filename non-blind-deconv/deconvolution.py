@@ -154,7 +154,8 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--save_path", type=str, default="../checkpoints/city_chunkedMC.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/city_chunkedMC")    parser.add_argument("--num_mc_samples", type=int, default=4000)
+    parser.add_argument("--logdir", type=str, default="../runs/city_chunkedMC")    
+    parser.add_argument("--num_mc_samples", type=int, default=4000)
     parser.add_argument("--boundary", choices=("reflect", "clamp"), default="reflect",
                         help="Boundary handling for sampled source coordinates.")
     parser.add_argument("--progressive_steps", type=int, default=300)
