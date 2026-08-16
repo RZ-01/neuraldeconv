@@ -34,13 +34,24 @@ def sliding_window_step(
     stochastic_alpha: float = 0.0,
     use_reflect: bool = True,
     mc_chunk_size: int = 0,
+    crop_region: tuple = None,
 ) -> dict:
     h, w = image_norm.shape
-    ph = min(patch_size, h)
-    pw = min(patch_size, w)
 
-    y0 = torch.randint(0, max(h - ph + 1, 1), (1,)).item()
-    x0 = torch.randint(0, max(w - pw + 1, 1), (1,)).item()
+    if crop_region is not None:
+        cy1, cy2, cx1, cx2 = crop_region
+        cy1, cy2 = max(cy1, 0), min(cy2, h)
+        cx1, cx2 = max(cx1, 0), min(cx2, w)
+    else:
+        cy1, cy2, cx1, cx2 = 0, h, 0, w
+
+    region_h = cy2 - cy1
+    region_w = cx2 - cx1
+    ph = min(patch_size, region_h)
+    pw = min(patch_size, region_w)
+
+    y0 = cy1 + torch.randint(0, max(region_h - ph + 1, 1), (1,)).item()
+    x0 = cx1 + torch.randint(0, max(region_w - pw + 1, 1), (1,)).item()
 
     inv_shape_gpu = inv_shape.to(device, non_blocking=True)
     yy = torch.arange(y0, y0 + ph, dtype=torch.float32, device=device)

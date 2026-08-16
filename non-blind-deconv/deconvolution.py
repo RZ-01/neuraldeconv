@@ -218,7 +218,7 @@ def main():
     # mc samples: hxw x 5.4869
     h, w = image_norm.shape
     num_pixels_per_step = 6500
-    steps = int(h * w * 160 / num_pixels_per_step)
+    steps = min(int(h * w * 160 / num_pixels_per_step), 10000)
 
     encoder_config = {
         "otype": "HashGrid",
@@ -270,7 +270,7 @@ def main():
     # discrete_psf = torch.flip(discrete_psf, [0, 1])
     print(f"PSF loaded: shape={discrete_psf.shape}")
     h_psf, w_psf = discrete_psf.shape
-    num_mc_samples = int(h_psf * w_psf * 4000 / 729)  # scale with PSF size, but max 4000
+    num_mc_samples = min(int(h_psf * w_psf * 4000 / 729), 4000)  # scale with PSF size, but max 4000
     print(f"Calculated steps: {steps}, num_mc_samples: {num_mc_samples}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
@@ -344,6 +344,7 @@ def main():
                 stochastic_alpha=current_alpha,
                 use_reflect=(args.boundary == "reflect"),
                 mc_chunk_size=args.mc_chunk_size,
+                crop_region=(13000, 13000 + 4096, 32500, 32500 + 4096),
             )
 
         for key, value in loss_dict.items():
