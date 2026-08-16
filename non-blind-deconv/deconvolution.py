@@ -148,14 +148,13 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/Deblur-INR/datasets/lai/im05_ker04.png")
-    parser.add_argument("--psf_path", type=str, default="/workspace/ker04_truth.png",
+    parser.add_argument("--image_path", type=str, default="../city_blur.png")
+    parser.add_argument("--psf_path", type=str, default="../psf.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_best_with_calculation.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_best_with_calculation")
-    parser.add_argument("--num_mc_samples", type=int, default=4000)
+    parser.add_argument("--save_path", type=str, default="../checkpoints/city_chunkedMC.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/city_chunkedMC")    parser.add_argument("--num_mc_samples", type=int, default=4000)
     parser.add_argument("--boundary", choices=("reflect", "clamp"), default="reflect",
                         help="Boundary handling for sampled source coordinates.")
     parser.add_argument("--progressive_steps", type=int, default=300)
@@ -218,7 +217,7 @@ def main():
     # mc samples: hxw x 5.4869
     h, w = image_norm.shape
     num_pixels_per_step = 6500
-    steps = min(int(h * w * 160 / num_pixels_per_step), 10000)
+    steps = int(h * w * 160 / num_pixels_per_step)
 
     encoder_config = {
         "otype": "HashGrid",
@@ -270,7 +269,7 @@ def main():
     # discrete_psf = torch.flip(discrete_psf, [0, 1])
     print(f"PSF loaded: shape={discrete_psf.shape}")
     h_psf, w_psf = discrete_psf.shape
-    num_mc_samples = min(int(h_psf * w_psf * 4000 / 729), 4000)  # scale with PSF size, but max 4000
+    num_mc_samples = int(h_psf * w_psf * 4000 / 729)  # scale with PSF size, but max 4000
     print(f"Calculated steps: {steps}, num_mc_samples: {num_mc_samples}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
