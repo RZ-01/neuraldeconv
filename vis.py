@@ -1,46 +1,69 @@
-import cv2, numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from pathlib import Path
-from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
+"""
+验证 rl_reflect 与 skimage 参考实现在图像内部的一致性。
 
-gt   = cv2.imread('/workspace/temp/W_DIP/datasets/levin/gt/im1.png', cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.
-blur = cv2.imread('/workspace/temp/W_DIP/datasets/levin/blur/im1_kernel2_img.png', cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.
-wdip = cv2.imread('/workspace/temp/W_DIP/results/levin/WDIP/im1_kernel2_img_x.png', cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.
-inferred = cv2.imread('/workspace/temp/workspace/inference_2d/inferred.png', cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.
+用法：
+    python verify_rl.py --input image.png --psf psf.png --num_iter 30
+"""
 
-comparisons = [('blurred input', blur), ('WDIP', wdip), ('our inferred', inferred)]
-scores = []
-for name, img in comparisons:
-    p = psnr(gt, img, data_range=1.)
-    s = ssim(gt, img, data_range=1.)
-    scores.append((name, p, s))
-    print(f'{name:15s}  PSNR={p:.2f}  SSIM={s:.4f}')
+import argparse
+import numpy as np
+from skimage.restoration import richardson_lucy as skrl
 
-fig, axes = plt.subplots(2, 4, figsize=(16, 8), constrained_layout=True)
+from . import load_input_image, load_psf, rl_reflect
 
-axes[0, 0].imshow(gt, cmap='gray', vmin=0, vmax=1)
-axes[0, 0].set_title('Ground truth')
-axes[1, 0].axis('off')
 
-for idx, ((name, img), (_, p, s)) in enumerate(zip(comparisons, scores), start=1):
-    axes[0, idx].imshow(img, cmap='gray', vmin=0, vmax=1)
-    axes[0, idx].set_title(f'{name}\nPSNR={p:.2f}, SSIM={s:.4f}')
+def compare(image: np.ndarray, psf: np.ndarray, num_iter: int) -> None:
+    # 对彩色图只取第一个通道，省去多通道循环
+    if image.ndim == 3:
+        image = image[:, :, 0]
 
-    diff = np.abs(gt - img)
-    im = axes[1, idx].imshow(diff, cmap='magma', vmin=0, vmax=1)
-    axes[1, idx].set_title(f'|GT - {name}|')
+    image = np.maximum(image, 1e-10).astype(np.float32)
+    psf_flipped = np.flip(psf).copy()
 
-for ax in axes.ravel():
-    ax.set_xticks([])
-    ax.set_yticks([])
+    # ------------------------------------------------------------------
+    # 两种实现
+    # ------------------------------------------------------------------
+    ref  = skrl(image, psf, num_iter=num_iter).astype(np.float32)
+    ours = rl_reflect(image, psf, psf_flipped, num_iter).astype(np.float32)
 
-cbar = fig.colorbar(im, ax=axes[1, 1:], fraction=0.04, pad=0.02)
-cbar.set_label('Absolute error')
+    # ------------------------------------------------------------------
+    # 只看内部：裁掉 2× PSF 尺寸的四周
+    # ------------------------------------------------------------------
+    ph = psf.shape[0] * 2
+    pw = psf.shape[1] * 2
 
-output_dir = Path('/workspace/temp/workspace/inference_2d')
-output_dir.mkdir(parents=True, exist_ok=True)
-output_path = output_dir / 'comparison_plot.png'
-fig.savefig(output_path, dpi=200)
-print(f'Saved visualization: {output_path}')
+    ref_crop  = ref[ph:-ph, pw:-pw]
+    ours_crop = ours[ph:-ph, pw:-pw]
+
+    diff = np.abs(ref_crop - ours_crop)
+
+    print(f"PSF shape   : {psf.shape}")
+    print(f"Image shape : {image.shape}")
+    print(f"Crop margin : {ph}px (h), {pw}px (w)")
+    print(f"Crop shape  : {ref_crop.shape}")
+    print()
+    print(f"Max abs diff  : {diff.max():.6e}")
+    print(f"Mean abs diff : {diff.mean():.6e}")
+    print(f"RMSE          : {np.sqrt(np.mean(diff**2)):.6e}")
+
+    threshold = 1e-3
+    ok = diff.max() < threshold
+    print()
+    print(f"{'[PASS]' if ok else '[FAIL]'}  max diff < {threshold}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input",    type=str, required=True)
+    parser.add_argument("--psf",      type=str, required=True)
+    parser.add_argument("--num_iter", type=int, default=30)
+    args = parser.parse_args()
+
+    image = load_input_image(args.input)
+    psf   = load_psf(args.psf)
+
+    compare(image, psf, args.num_iter)
+
+
+if __name__ == "__main__":
+    main()
