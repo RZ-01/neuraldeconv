@@ -1,10 +1,8 @@
 import argparse
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
-
 # 必须在 import cv2 之前设置
-os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = "2000000000"
+#os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = "2000000000"
 
 import cv2
 import numpy as np
@@ -139,20 +137,17 @@ def run_rl(
 
     else:
         channel_count = image.shape[2]
-        print(f"处理彩色图像，共 {channel_count} 个通道（并行）……")
+        print(f"处理彩色图像，共 {channel_count} 个通道……")
 
-        def _process(cid: int) -> tuple[int, np.ndarray]:
-            return cid, deconvolve_single_channel(
-                image[:, :, cid], psf, psf_flipped, num_iter
+        channel_results = []
+
+        for cid in range(channel_count):
+            print(f"  处理通道 {cid + 1}/{channel_count}")
+            channel_results.append(
+                deconvolve_single_channel(
+                    image[:, :, cid], psf, psf_flipped, num_iter
+                )
             )
-
-        channel_results = [None] * channel_count
-
-        # scipy.ndimage 会释放 GIL，ThreadPoolExecutor 可以真正并行
-        with ThreadPoolExecutor(max_workers=channel_count) as executor:
-            for cid, ch_result in executor.map(_process, range(channel_count)):
-                channel_results[cid] = ch_result
-                print(f"  通道 {cid + 1}/{channel_count} 完成")
 
         result = np.stack(channel_results, axis=-1)
 
