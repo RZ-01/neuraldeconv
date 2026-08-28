@@ -21,3 +21,5 @@ Deblur-INR/
 
 *.txt
 .vscode/
+image_deblur_datasets/
+inference/
